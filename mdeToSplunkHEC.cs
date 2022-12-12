@@ -27,13 +27,17 @@ namespace Splunk.mdeToSplunkHEC
     public static class mdeToSplunkHEC
     {
         const int RECORDS_PER_BATCH = 50;
-        
+
         [FunctionName("mdeToSplunkHEC")]
         public static async Task Run([EventHubTrigger(
                                             eventHubName: "%EVENTHUB_NAME%",
                                             ConsumerGroup = "%EVENTHUB_CONSUMERGROUP%",
                                             Connection = "EVENTHUB_CONNECTION_STRING")] EventData[] events, ILogger log)
         {
+            bool writeToBlob = Helpers.Utilities.GetEnvironmentVariable("WriteToBlob", "false") == "true";
+            string blobConnectionString = Helpers.Utilities.GetEnvironmentVariable("BlobConnectionString");
+            string containerName = Helpers.Utilities.GetEnvironmentVariable("ContainerName");
+
             bool expectParsedMessage = true;
             var exceptions = new List<Exception>();
             List<EventData> archiveItems = new List<EventData>();
@@ -42,10 +46,10 @@ namespace Splunk.mdeToSplunkHEC
             //string sourcetype = Helpers.Utilities.GetEnvironmentVariable("MDE_SOURCETYPE");
             //splunkEvent.sourcetype = sourcetype;
 
-            if(!string.IsNullOrEmpty(Helpers.Utilities.GetEnvironmentVariable("PARSED_MESSAGE")) &&
+            if (!string.IsNullOrEmpty(Helpers.Utilities.GetEnvironmentVariable("PARSED_MESSAGE")) &&
                 string.Equals(Helpers.Utilities.GetEnvironmentVariable("PARSED_MESSAGE"), "false", StringComparison.CurrentCultureIgnoreCase))
                 expectParsedMessage = false;
-            
+
             for (var i = 0; i < events.Length; i++)
             {
                 var item = events[i];
@@ -57,7 +61,7 @@ namespace Splunk.mdeToSplunkHEC
                     log.LogInformation($"Parsing message: {messageBody}");
                     var eventMessages = messageBody.Split("\r\n");
                     log.LogInformation($"Found {eventMessages.Length} events.");
-                    for(var j = 0; j < eventMessages.Length; j++)
+                    for (var j = 0; j < eventMessages.Length; j++)
                     {
                         var eventMessage = eventMessages[j];
                         try
@@ -66,24 +70,40 @@ namespace Splunk.mdeToSplunkHEC
 
                             message = JsonConvert.DeserializeObject<dynamic>(eventMessage);
 
-                            if(expectParsedMessage == true){
+                            if (expectParsedMessage == true)
+                            {
                                 string eventTimeStamp = splunk.getTimeStamp(message);
                                 if (!string.IsNullOrEmpty(eventTimeStamp)) { message.time = eventTimeStamp; }
 
                                 splunkEvent.@event.records.Add(message);
+                                if (writeToBlob)
+                                {
+                                    try
+                                    {
+                                        var filename = System.Guid.NewGuid().ToString() + ".json";
+                                        var serializedBody = JsonConvert.SerializeObject(message);
+                                        // write to blob storage
+                                        await Helpers.Utilities.WriteToBlob(blobConnectionString, containerName, filename, serializedBody);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        log.LogError(ex.Message, ex);
+                                    }
+                                }
                             }
-                            else{
-                                foreach(dynamic recordEntry in message.records)
+                            else
+                            {
+                                foreach (dynamic recordEntry in message.records)
                                 {
                                     string eventTimeStamp = splunk.getTimeStamp(recordEntry);
                                     if (!string.IsNullOrEmpty(eventTimeStamp)) { recordEntry.time = eventTimeStamp; }
-                                    
+
                                     splunkEvent.@event.records.Add(recordEntry);
                                 }
                             }
 
-                            if (expectParsedMessage == false || (splunkEvent.@event.records.Count >= RECORDS_PER_BATCH || 
-                                (i >= events.Length -1 && j >= eventMessages.Length -1))) // last message
+                            if (expectParsedMessage == false || (splunkEvent.@event.records.Count >= RECORDS_PER_BATCH ||
+                                (i >= events.Length - 1 && j >= eventMessages.Length - 1))) // last message
                             {
                                 await splunk.sendPayloadToHEC(splunkEvent, log);
                                 log.LogInformation($"Processed batch of {splunkEvent.@event.records.Count}");
